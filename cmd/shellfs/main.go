@@ -47,15 +47,40 @@ func main() {
 // ShellFileSystem roots the shell command file system
 type ShellFileSystem struct{}
 
-func (ShellFileSystem) Root() (fs.Node, error) {
-	return Dir{}, nil
+type Dir struct {
+	origin string
+	Files  *map[string]File
 }
 
-type Dir struct {
+type File struct {
+	Att *fuse.Attr
+}
+
+func (ShellFileSystem) Root() (fs.Node, error) {
+	files := make(map[string]File)
+	files["Test\\ Large\\ File"] = File{Att: &fuse.Attr{Inode: 2, Mode: 0o444}}
+	return Dir{origin: "/", Files: &files}, nil
 }
 
 func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Inode = 1
 	a.Mode = os.ModeDir | 0o555
+	return nil
+}
+
+func (self Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	files := *self.Files
+	fmt.Printf("%+v\n", files)
+	fmt.Printf("%s\n", name)
+	return files[name], nil
+}
+
+func (Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	return []fuse.Dirent{{Inode: 2, Name: "Test Large File", Type: fuse.DT_File}}, nil
+}
+
+func (my File) Attr(ctx context.Context, a *fuse.Attr) error {
+	a.Inode = my.Att.Inode
+	a.Mode = my.Att.Mode
 	return nil
 }
