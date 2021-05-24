@@ -10,7 +10,7 @@ import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	_ "bazil.org/fuse/fs/fstestutil"
-	"bazil.org/fuse/fuseutil"
+	_ "bazil.org/fuse/fuseutil"
 )
 
 func usage() {
@@ -39,9 +39,10 @@ func main() {
 	}
 	defer c.Close()
 
-	defer fuse.Unmount(mountpoint) // doesn't do anything...
+	defer fuse.Unmount(mountpoint) // ... never gets called
 
-	err = fs.Serve(c, ShellFileSystem{Origin: source})
+	err = fs.Serve(c, ShellFileSystem{origin: source})
+	fuse.Unmount(mountpoint)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -49,81 +50,96 @@ func main() {
 
 // ShellFileSystem roots the shell command file system
 type ShellFileSystem struct {
-	Origin string
+	origin string
 }
 
+// Dir is a directory in the filesystem. It has a source location
 type Dir struct {
-	Origin string
-	Files  *map[string]File
+	origin string
 }
 
+// File is a file in the filesystem. It has a source location
 type File struct {
-	Attributes *fuse.Attr
-	Inode      uint64
-	Mode       os.FileMode
+	from string
 }
 
-type FileHandle struct {
+type CommandFileHandle struct {
+	from string
 }
 
-func (ShellFileSystem) Root() (fs.Node, error) {
-	files := make(map[string]File)
-	files["test-large-file"] = File{Attributes: &fuse.Attr{Inode: 2, Mode: 0o444}}
-	return Dir{Origin: "/", Files: &files}, nil
+//////////////////////////////////////////////////////////////////
+// Root
+/////////////////////////////////////////////////////////////////
+
+func (sfs ShellFileSystem) Root() (fs.Node, error) {
+	fmt.Printf("Returning Root()\n")
+	return Dir{origin: sfs.origin}, nil
 }
 
-func (Dir) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = 1
-	a.Mode = os.ModeDir | 0o555
+//////////////////////////////////////////////////////////////////
+// Dir
+/////////////////////////////////////////////////////////////////
+
+func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
+	fmt.Printf("%s\n", name)
+	return File{from: d.origin + "my-info"}, nil
+}
+
+func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+	fmt.Println("ReadDirAll")
+	return []fuse.Dirent{
+		{Inode: 2, Name: "my-info", Type: fuse.DT_File},
+	}, nil
+}
+
+func (d Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
+	fmt.Printf("%#v\n", attr)
+	attr.Inode = 1
+	attr.Mode = os.ModeDir | 0o755
 	return nil
 }
 
-func (self Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	tmp, present := (*self.Files)[name]
-	if present {
-		return tmp, nil
-	}
-	return nil, fuse.ENOENT
-}
+//////////////////////////////////////////////////////////////////
+// File
+/////////////////////////////////////////////////////////////////
 
-func (Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	return []fuse.Dirent{{Inode: 2, Name: "test-large-file", Type: fuse.DT_File}}, nil
-}
-
-func (my File) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = my.Attributes.Inode
-	a.Mode = my.Attributes.Mode
-	a.Size = 345
-	fmt.Printf("%#v\n", a)
-	return nil
-}
-
-func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (f File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
 	fmt.Printf("%#v\n", req)
 	fmt.Printf("%#v\n", resp)
-	resp.Flags |= fuse.OpenNonSeekable | fuse.OpenDirectIO
-	return &FileHandle{}, nil
+	return CommandFileHandle{from: f.from}, nil
 }
 
-func (fh *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	fmt.Printf("%#v\n", req)
-	fmt.Printf("%#v\n", resp)
-	fuseutil.HandleRead(req, resp, []byte("Hello\n"))
+func (f File) Attr(ctx context.Context, attr *fuse.Attr) error {
+	fmt.Printf("%#v\n", attr)
+	// EOF will be signaled when Read returns less than asked, so...
+	attr.Size = 3 // This must be as large or larger than the target data
+	attr.Mode = 0o644
 	return nil
 }
 
-func (fh *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+//////////////////////////////////////////////////////////////////
+// CommandFileHandler
+/////////////////////////////////////////////////////////////////
+
+func (cfh CommandFileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	fmt.Printf("%#v\n", req)
+	fmt.Printf("%#v\n", resp)
+	resp.Data = []byte("Hi\n")
+	return nil
+}
+
+func (cfh CommandFileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	fmt.Printf("%#v\n", req)
 	return nil
 }
 
 // Confirm the various types are implement the necessary interfaces
-var _ fs.HandleReader = &FileHandle{}
-var _ fs.Node = (*File)(nil)
-var _ fs.Node = (*Dir)(nil)
 var _ fs.FS = (*ShellFileSystem)(nil)
+var _ fs.Node = (*Dir)(nil)
+var _ fs.HandleReadDirAller = (*Dir)(nil)
 var _ fs.NodeStringLookuper = (*Dir)(nil)
+var _ fs.Node = (*File)(nil)
 var _ fs.NodeOpener = (*File)(nil)
-var _ fs.Handle = (*FileHandle)(nil)
-var _ fs.HandleReleaser = (*FileHandle)(nil)
-var _ fs.HandleReader = (*FileHandle)(nil)
+var _ fs.Handle = (*CommandFileHandle)(nil)
+var _ fs.HandleReleaser = (*CommandFileHandle)(nil)
+var _ fs.HandleReader = (*CommandFileHandle)(nil)
