@@ -254,7 +254,7 @@ func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	full_path := filepath.Join(d.origin, name)
 	e := ENTRIES[full_path]
 	if e == nil {
-		return nil, errors.New("Path does not exist")
+		return nil, fuse.ENOENT
 	} else if e.file_type == ET_CommandFile {
 		var rV CommandFile
 		rV.size = e.size
