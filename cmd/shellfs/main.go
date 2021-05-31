@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 
 	io_fs "io/fs"
@@ -63,8 +66,8 @@ func main() {
 	}
 }
 
-var TREE map[string][]Entry
-var ENTRIES map[string]Entry
+var TREE map[string][]*Entry
+var ENTRIES map[string]*Entry
 
 type Lifecycle struct{}
 
@@ -113,21 +116,22 @@ func parse_out_command_files(out chan<- Entry) func(string, io_fs.DirEntry, erro
 }
 
 func assemble_entries(in <-chan Entry, lifecycle <-chan Lifecycle) {
-	tree := make(map[string][]Entry)
-	entries := make(map[string]Entry)
+	tree := make(map[string][]*Entry)
+	entries := make(map[string]*Entry)
 	var inode uint64 = 1
 	for {
 		select {
 		case item := <-in:
 			item.inode = inode
+			go item.compute_size()
 			inode++
-			tree[item.path] = append(tree[item.path], item)
-			entries[filepath.Join(item.path, item.name)] = item
+			tree[item.path] = append(tree[item.path], &item)
+			entries[filepath.Join(item.path, item.name)] = &item
 		case <-lifecycle:
 			TREE = tree
 			ENTRIES = entries
-			tree = make(map[string][]Entry)
-			entries = make(map[string]Entry)
+			tree = make(map[string][]*Entry)
+			entries = make(map[string]*Entry)
 			fmt.Println("The tree:")
 			for k, v := range TREE {
 				fmt.Printf("%s:\n", k)
@@ -144,6 +148,54 @@ func assemble_entries(in <-chan Entry, lifecycle <-chan Lifecycle) {
 	}
 }
 
+func command_file_to_size(e Entry) uint64 {
+	path := filepath.Join(e.path, box_command_file_name(e.name))
+	cmd := exec.Cmd{Path: "./size", Dir: path}
+	out, err := cmd.Output()
+	if err == nil {
+		// newline at the end can cause problems
+		uint_str := strings.TrimSpace(string(out))
+		size, err := strconv.ParseUint(uint_str, 10, 64)
+		if err == nil {
+			return size
+		}
+	} else { // that comamnd errored...
+		// run the actual command and hope its size will always be the
+		// same on subsequent runs
+		bytes_read := uint64(0)
+		data := make([]byte, 1<<22) // 4 meg
+		cmd = exec.Cmd{Path: "./cmd", Dir: path}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			log.Print(err)
+			return 0
+		}
+		for {
+			n, err := stdout.Read(data)
+			bytes_read = bytes_read + uint64(n)
+			if err == io.ErrUnexpectedEOF || err == io.EOF {
+				break
+			} else if err != nil {
+				return 0
+			}
+		}
+		return bytes_read
+	}
+	return 0
+}
+
+func (e *Entry) compute_size() {
+	e.size = math.MaxInt64
+	if e.file_type == ET_Directory {
+		e.size = 4096
+	} else if e.file_type == ET_CommandFile {
+		e.size = command_file_to_size(*e)
+	}
+}
+
 type EntryType int
 
 const (
@@ -157,7 +209,7 @@ type Entry struct {
 	inode     uint64
 	name      string
 	path      string
-	size      func() uint64
+	size      uint64
 }
 
 // ShellFileSystem roots the shell command file system
@@ -168,11 +220,15 @@ type ShellFileSystem struct {
 // Dir is a directory in the filesystem. It has a source location
 type Dir struct {
 	origin string
+	size   uint64
+	inode  uint64
 }
 
 // CommandFile is a file in the filesystem. It has a source location
 type CommandFile struct {
-	from string
+	from  string
+	size  uint64
+	inode uint64
 }
 
 // CommandFileHandle is an open file descriptor, with what's necessary to read.
@@ -187,7 +243,7 @@ type CommandFileHandle struct {
 /////////////////////////////////////////////////////////////////
 
 func (sfs ShellFileSystem) Root() (fs.Node, error) {
-	return Dir{origin: sfs.origin}, nil
+	return Dir{origin: sfs.origin, size: 4096, inode: 1}, nil
 }
 
 //////////////////////////////////////////////////////////////////
@@ -197,13 +253,19 @@ func (sfs ShellFileSystem) Root() (fs.Node, error) {
 func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	full_path := filepath.Join(d.origin, name)
 	e := ENTRIES[full_path]
-	if e.file_type == ET_CommandFile {
+	if e == nil {
+		return nil, errors.New("Path does not exist")
+	} else if e.file_type == ET_CommandFile {
 		var rV CommandFile
+		rV.size = e.size
 		rV.from = filepath.Join(d.origin, box_command_file_name(name))
+		rV.inode = e.inode
 		return rV, nil
 	} else if e.file_type == ET_Directory {
 		var rV Dir
+		rV.size = e.size
 		rV.origin = full_path
+		rV.inode = e.inode
 		return rV, nil
 	}
 	return nil, errors.New("Type not compatible")
@@ -211,8 +273,6 @@ func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
 func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	var rV []fuse.Dirent
-	fmt.Println(d.origin)
-	fmt.Println(TREE[d.origin])
 	for _, e := range TREE[d.origin] {
 		var de fuse.Dirent
 		de.Inode = e.inode
@@ -228,7 +288,8 @@ func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 func (d Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
-	attr.Inode = 1
+	attr.Inode = d.inode
+	attr.Size = d.size
 	attr.Mode = os.ModeDir | 0o755
 	return nil
 }
@@ -252,8 +313,9 @@ func (f CommandFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse
 }
 
 func (f CommandFile) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Inode = f.inode
 	// EOF will be signaled when Read returns less than asked, so...
-	attr.Size = 10000 // This must be as large or larger than the target data
+	attr.Size = f.size // This must be as large or larger than the target data
 	attr.Mode = 0o644
 	return nil
 }
