@@ -104,6 +104,8 @@ func parse_out_command_files(out chan<- Entry) func(string, io_fs.DirEntry, erro
 			ft = ET_CommandFile
 		} else if is_dir {
 			ft = ET_Directory
+		} else {
+			ft = ET_ReadOnlyFile
 		}
 		out <- Entry{file_type: ft,
 			path: true_path,
@@ -187,12 +189,24 @@ func command_file_to_size(e Entry) uint64 {
 	return 0
 }
 
+func read_only_file_to_size(e Entry) uint64 {
+	path := filepath.Join(e.path, e.name)
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Println(err)
+		return 0
+	}
+	return uint64(info.Size())
+}
+
 func (e *Entry) compute_size() {
 	e.size = math.MaxInt64
 	if e.file_type == ET_Directory {
 		e.size = 4096
 	} else if e.file_type == ET_CommandFile {
 		e.size = command_file_to_size(*e)
+	} else if e.file_type == ET_ReadOnlyFile {
+		e.size = read_only_file_to_size(*e)
 	}
 }
 
@@ -201,6 +215,7 @@ type EntryType int
 const (
 	ET_CommandFile EntryType = iota
 	ET_Directory
+	ET_ReadOnlyFile
 )
 
 // MakeEntry is used to help populate the filesystem
@@ -231,11 +246,22 @@ type CommandFile struct {
 	inode uint64
 }
 
+// ReadOnlyFile is a real file in the filesystem.
+type ReadOnlyFile struct {
+	from  string
+	size  uint64
+	inode uint64
+}
+
 // CommandFileHandle is an open file descriptor, with what's necessary to read.
 type CommandFileHandle struct {
-	from   string
 	stdout io.ReadCloser
 	cmd    exec.Cmd
+}
+
+// ReadOnlyFileHandle is a real file in the filesystem.
+type ReadOnlyFileHandle struct {
+	r io.ReadCloser
 }
 
 //////////////////////////////////////////////////////////////////
@@ -267,6 +293,12 @@ func (d Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		rV.origin = full_path
 		rV.inode = e.inode
 		return rV, nil
+	} else if e.file_type == ET_ReadOnlyFile {
+		var rV ReadOnlyFile
+		rV.inode = e.inode
+		rV.from = filepath.Join(d.origin, name)
+		rV.size = e.size
+		return rV, nil
 	}
 	return nil, errors.New("Type not compatible")
 }
@@ -277,7 +309,7 @@ func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		var de fuse.Dirent
 		de.Inode = e.inode
 		de.Name = e.name
-		if e.file_type == ET_CommandFile {
+		if e.file_type == ET_CommandFile || e.file_type == ET_ReadOnlyFile {
 			de.Type = fuse.DT_File
 		} else if e.file_type == ET_Directory {
 			de.Type = fuse.DT_Dir
@@ -309,7 +341,7 @@ func (f CommandFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse
 		return nil, err
 	}
 	resp.Flags |= fuse.OpenNonSeekable
-	return CommandFileHandle{from: f.from, cmd: cmd, stdout: stdout}, nil
+	return CommandFileHandle{cmd: cmd, stdout: stdout}, nil
 }
 
 func (f CommandFile) Attr(ctx context.Context, attr *fuse.Attr) error {
@@ -337,6 +369,45 @@ func (cfh CommandFileHandle) Read(ctx context.Context, req *fuse.ReadRequest, re
 func (cfh CommandFileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
 	cfh.cmd.Process.Signal(syscall.SIGTERM)
 	return nil
+}
+
+//////////////////////////////////////////////////////////////////
+// ReadOnlyFile
+/////////////////////////////////////////////////////////////////
+
+func (rof ReadOnlyFile) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	file, err := os.Open(rof.from)
+	if err != nil {
+		return nil, err
+	}
+	resp.Flags |= fuse.OpenNonSeekable
+	return ReadOnlyFileHandle{r: file}, nil
+}
+
+func (rof ReadOnlyFile) Attr(ctx context.Context, attr *fuse.Attr) error {
+	attr.Inode = rof.inode
+	// EOF will be signaled when Read returns less than asked, so...
+	attr.Size = rof.size // This must be as large or larger than the target data
+	attr.Mode = 0o644
+	return nil
+}
+
+//////////////////////////////////////////////////////////////////
+// ReadOnlyFileHandler
+/////////////////////////////////////////////////////////////////
+
+func (rofh ReadOnlyFileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	buf := make([]byte, req.Size)
+	n, err := io.ReadFull(rofh.r, buf)
+	if err == io.ErrUnexpectedEOF || err == io.EOF {
+		err = nil
+	}
+	resp.Data = buf[:n]
+	return err
+}
+
+func (rofh ReadOnlyFileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	return rofh.r.Close()
 }
 
 // Confirm the various types are implement the necessary interfaces
