@@ -1,0 +1,4 @@
+#!/bin/sh
+
+echo "My-next-info"
+echo "Keeps going like this."

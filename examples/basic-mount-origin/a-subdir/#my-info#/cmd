@@ -1,0 +1,4 @@
+#!/bin/sh
+
+echo "Dumping a mb of random text"
+dd if=/dev/urandom bs=1M count=1
