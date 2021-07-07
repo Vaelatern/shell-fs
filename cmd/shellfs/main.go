@@ -25,13 +25,16 @@ import (
 
 func usage() {
 	fmt.Printf("Usage of %s:\n", os.Args[0])
-	fmt.Printf("\t%s MOUNTPOINT FROM\n", os.Args[0])
+	fmt.Printf("\t%s [-s /path/to/size/pipe] MOUNTPOINT FROM\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
 func main() {
+	var blockingDonePipe = flag.String("s", "", "One line 'Sizes Synchronized' will be written to a pipe at this location. You can block on that pipe to wait for sizes to balance.")
 	flag.Usage = usage
 	flag.Parse()
+
+	var err error
 
 	if flag.NArg() != 2 {
 		usage()
@@ -39,6 +42,14 @@ func main() {
 	}
 	mountpoint := flag.Arg(0)
 	source := flag.Arg(1)
+
+	var fifo *os.File
+	if *blockingDonePipe != "" {
+		fifo, err = os.OpenFile(*blockingDonePipe, os.O_WRONLY, 0600)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	c, err := fuse.Mount(mountpoint,
 		fuse.FSName("shell-command-fs"),
@@ -52,9 +63,20 @@ func main() {
 	defer fuse.Unmount(mountpoint) // ... never gets called
 
 	fmt.Println("Starting scan...")
+	stable := make(chan StableFS)
 	entry_passage := make(chan Entry)
 	lifecycle := make(chan Lifecycle)
-	go assemble_entries(entry_passage, lifecycle)
+	go assemble_entries(entry_passage, lifecycle, stable)
+
+	go func() {
+		if fifo != nil {
+			select {
+			case <-stable:
+				fifo.Write([]byte("Sizes Synchronized\n"))
+				fifo.Close()
+			}
+		}
+	}()
 
 	parse_origin_dir(source, entry_passage, lifecycle)
 
@@ -70,6 +92,7 @@ var TREE map[string][]*Entry
 var ENTRIES map[string]*Entry
 
 type Lifecycle struct{}
+type StableFS struct{}
 
 func parse_origin_dir(path string, out chan<- Entry, lifecycle chan<- Lifecycle) error {
 	err := filepath.WalkDir(path, parse_out_command_files(out))
@@ -117,16 +140,18 @@ func parse_out_command_files(out chan<- Entry) func(string, io_fs.DirEntry, erro
 	}
 }
 
-func assemble_entries(in <-chan Entry, lifecycle <-chan Lifecycle) {
+func assemble_entries(in <-chan Entry, lifecycle <-chan Lifecycle, done chan<- StableFS) {
+	sizes := make(chan Entry)
+	var expect_sizes int64 = 0
 	tree := make(map[string][]*Entry)
 	entries := make(map[string]*Entry)
-	var inode uint64 = 1
+	var inode uint64 = 0
 	for {
 		select {
 		case item := <-in:
-			item.inode = inode
-			go item.compute_size()
 			inode++
+			item.inode = inode
+			go item.compute_size(sizes)
 			tree[item.path] = append(tree[item.path], &item)
 			entries[filepath.Join(item.path, item.name)] = &item
 		case <-lifecycle:
@@ -145,7 +170,13 @@ func assemble_entries(in <-chan Entry, lifecycle <-chan Lifecycle) {
 			for k, v := range ENTRIES {
 				fmt.Printf("%s: %#v\n", k, v)
 			}
-			inode = 1
+			expect_sizes += int64(inode)
+			inode = 0
+		case <-sizes:
+			expect_sizes -= 1
+			if expect_sizes == 0 {
+				done <- StableFS{}
+			}
 		}
 	}
 }
@@ -199,7 +230,7 @@ func read_only_file_to_size(e Entry) uint64 {
 	return uint64(info.Size())
 }
 
-func (e *Entry) compute_size() {
+func (e *Entry) compute_size(done chan<- Entry) {
 	e.size = math.MaxInt64
 	if e.file_type == ET_Directory {
 		e.size = 4096
@@ -208,6 +239,7 @@ func (e *Entry) compute_size() {
 	} else if e.file_type == ET_ReadOnlyFile {
 		e.size = read_only_file_to_size(*e)
 	}
+	done <- *e
 }
 
 type EntryType int

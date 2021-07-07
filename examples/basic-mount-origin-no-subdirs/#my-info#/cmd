@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "This is in my-info"
+sleep 60
+echo "Still here!"

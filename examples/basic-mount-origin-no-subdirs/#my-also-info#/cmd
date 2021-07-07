@@ -1,0 +1,5 @@
+#!/bin/sh
+
+echo "TESTING!!!!"
+sleep 10  # this shows how the size will delay as necessary. also the output.
+echo "TESTING!!!! AGAIN!"
