@@ -354,6 +354,7 @@ func (d Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 func (d Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Inode = d.inode
 	attr.Size = d.size
+	attr.Blocks = (d.size / 512) + 1
 	attr.Mode = os.ModeDir | 0o755
 	return nil
 }
@@ -380,6 +381,7 @@ func (f CommandFile) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Inode = f.inode
 	// EOF will be signaled when Read returns less than asked, so...
 	attr.Size = f.size // This must be as large or larger than the target data
+	attr.Blocks = (f.size / 512) + 1
 	attr.Mode = 0o644
 	return nil
 }
@@ -420,6 +422,7 @@ func (rof ReadOnlyFile) Attr(ctx context.Context, attr *fuse.Attr) error {
 	attr.Inode = rof.inode
 	// EOF will be signaled when Read returns less than asked, so...
 	attr.Size = rof.size // This must be as large or larger than the target data
+	attr.Blocks = (rof.size / 512) + 1
 	attr.Mode = 0o644
 	return nil
 }
